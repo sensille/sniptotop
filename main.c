@@ -13,6 +13,7 @@
 #include <string.h>
 #include <yaml.h>
 #include <assert.h>
+#include <sys/time.h>
 
 int debug = 0;
 
@@ -96,8 +97,14 @@ xcb_window_t find_wm_window(xcb_window_t win);
 void
 deb(const char *msg, ...)
 {
+	struct timeval tv;
+	struct tm tm;
 	if (!debug)
 		return;
+	gettimeofday(&tv, NULL);
+	localtime_r(&tv.tv_sec, &tm);
+	printf("%02d:%02d:%02d.%06ld ",
+		tm.tm_hour, tm.tm_min, tm.tm_sec, tv.tv_usec);
 	va_list args;
 	va_start (args, msg);
 	vprintf(msg, args);
@@ -766,7 +773,7 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 	if (rt == XCB_EXPOSE) {
 		xcb_expose_event_t *ev = (void *)e;
 
-		deb("Window %d exposed. Region to be redrawn at "
+		deb("Window 0x%x exposed. Region to be redrawn at "
 			"location (%d,%d), with dimension (%d,%d)\n",
 		ev->window, ev->x, ev->y, ev->width, ev->height);
 
@@ -928,6 +935,17 @@ int
 main(int argc, char **argv)
 {
 	xcb_generic_event_t *e;
+	int opt;
+	while ((opt = getopt(argc, argv, "d")) != -1) {
+		switch (opt) {
+		case 'd':
+			debug = 1;
+			break;
+		default:
+			fprintf(stderr, "Usage: %s [-d]\n", argv[0]);
+			exit(EXIT_FAILURE);
+		}
+	}
 
 	printf("\nTo add snips, click the large \"plus\" in the main window.\n"
 	       "Then select a window by clicking on it.\n"
