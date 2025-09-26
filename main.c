@@ -778,6 +778,14 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 		ev->window, ev->x, ev->y, ev->width, ev->height);
 
 		redraw_view(v);
+	} else if (rt == XCB_GRAPHICS_EXPOSURE) {
+		xcb_graphics_exposure_event_t *ev = (void *)e;
+
+		deb("Window 0x%x exposed. Region to be redrawn at "
+			"location (%d,%d), with dimension (%d,%d)\n",
+		ev->drawable, ev->x, ev->y, ev->width, ev->height);
+
+		redraw_view(v);
 	} else if (rt == XCB_BUTTON_PRESS) {
 		xcb_button_press_event_t *bp = (void *)e;
 		deb("button press event, detail %d\n", bp->detail);
@@ -892,6 +900,8 @@ handle_event(xcb_generic_event_t *e)
 	/* extract window from event */
 	if (rt == XCB_EXPOSE) {
 		win = ((xcb_expose_event_t *)e)->window;
+	} else if (rt == XCB_GRAPHICS_EXPOSURE) {
+		win = ((xcb_graphics_exposure_event_t *)e)->drawable;
 	} else if (rt == XCB_BUTTON_PRESS) {
 		win = ((xcb_button_press_event_t *)e)->event;
 	} else if (rt == XCB_KEY_PRESS) {
