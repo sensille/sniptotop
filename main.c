@@ -102,7 +102,7 @@ deb(const char *msg, ...)
 	va_start (args, msg);
 	vprintf(msg, args);
 	va_end(args);
-	printf("\n");
+	fflush(stdout);
 }
 
 void
@@ -525,6 +525,9 @@ destroy_view(view_ctx_t *v)
 
 	// if no more views for this target, free target as well
 	if (t->first_view == NULL) {
+		uint32_t eventmask = 0;
+		xcb_change_window_attributes(c, t->target, XCB_CW_EVENT_MASK,
+			&eventmask);
 		deb("No more views for target window 0x%x\n", t->target);
 		free(t->name);
 		xcb_damage_destroy(c, t->damage);
