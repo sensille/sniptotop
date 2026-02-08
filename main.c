@@ -14,8 +14,12 @@
 #include <yaml.h>
 #include <assert.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 int debug = 0;
+int no_restore = 0;
+char state_path[512] = "";
 
 const char *program_name = "sniptotop";
 const char *class_name = "sniptotop;SnipToTop";
@@ -351,6 +355,58 @@ initialize_top_window(void)
 	add_window(top_window, WIN_TYPE_TOP, t);
 }
 
+xcb_window_t
+create_view_window(uint8_t depth, xcb_visualid_t visual,
+	xcb_colormap_t colormap, int x, int y, int w, int h,
+	uint32_t back_pixel)
+{
+	uint32_t mask;
+	uint32_t values[5];
+	uint32_t black = 0xff000000;
+	xcb_atom_t atom_motif_hints = get_atom(c, "_MOTIF_WM_HINTS");
+
+	xcb_window_t win = xcb_generate_id(c);
+	mask = XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL |
+		XCB_CW_OVERRIDE_REDIRECT |
+		XCB_CW_EVENT_MASK |
+		XCB_CW_COLORMAP;
+	values[0] = back_pixel;
+	values[1] = black;
+	values[2] = 0;
+	values[3] = XCB_EVENT_MASK_EXPOSURE |
+		XCB_EVENT_MASK_BUTTON_PRESS |
+		XCB_EVENT_MASK_KEY_PRESS |
+		XCB_EVENT_MASK_BUTTON_3_MOTION;
+	values[4] = colormap;
+	xcb_create_window(c, depth, win,
+		screen->root, x, y, w, h,
+		0, InputOutput, visual,
+		mask, values);
+
+	xcb_change_property(c, XCB_PROP_MODE_REPLACE, win,
+		XCB_ATOM_WM_TRANSIENT_FOR, XCB_ATOM_WINDOW, 32, 1,
+		&top_window);
+	values[0] = get_atom(c, "_NET_WM_STATE_ABOVE");
+	xcb_change_property(c, XCB_PROP_MODE_REPLACE, win,
+		get_atom(c, "_NET_WM_STATE"), XCB_ATOM_ATOM, 32, 1,
+		&values);
+
+	xcb_size_hints_t hints;
+	xcb_icccm_size_hints_set_min_size(&hints, w, h);
+	xcb_icccm_size_hints_set_max_size(&hints, w, h);
+	xcb_icccm_set_wm_size_hints(c, win,
+		XCB_ATOM_WM_NORMAL_HINTS, &hints);
+
+	motif_hints_t m_hints = {
+		.flags = 2, .decorations = 0,
+	};
+	xcb_change_property(c, XCB_PROP_MODE_REPLACE, win,
+		atom_motif_hints, atom_motif_hints, 32, 5, &m_hints);
+
+	xcb_map_window(c, win);
+	return win;
+}
+
 int
 create_view(xcb_window_t window, xcb_window_t wm_window, char *name,
 	int x1, int y1, int x2, int y2)
@@ -364,11 +420,9 @@ create_view(xcb_window_t window, xcb_window_t wm_window, char *name,
 	int cap_height;
 	int cap_x;
 	int cap_y;
-	int mask;
 	uint32_t values[20];
 	int t_ix;
 	target_ctx_t *t;
-	xcb_atom_t atom_motif_hints = get_atom(c, "_MOTIF_WM_HINTS");
 
 	attr_cookie = xcb_get_window_attributes(c, window);
 	win_attrs = xcb_get_window_attributes_reply(c, attr_cookie, &err);
@@ -396,68 +450,12 @@ create_view(xcb_window_t window, xcb_window_t wm_window, char *name,
 
 	uint32_t black = 0xff000000;
 	uint32_t grey = 0xff808080;
-	deb("black: 0x%08x white: 0x%08x\n",
-		screen->black_pixel, screen->white_pixel);
-	xcb_window_t new_window = xcb_generate_id(c);
-	mask = XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL |
-		XCB_CW_OVERRIDE_REDIRECT |
-		XCB_CW_EVENT_MASK |
-		XCB_CW_COLORMAP;
-	values[0] = black;
-	values[1] = black;
-	values[2] = 0; // override-redirect
-	values[3] = XCB_EVENT_MASK_EXPOSURE |
-		XCB_EVENT_MASK_BUTTON_PRESS |
-		XCB_EVENT_MASK_KEY_PRESS |
-		XCB_EVENT_MASK_BUTTON_3_MOTION;
-	values[4] = win_attrs->colormap;
 	int n_border_width = 2;
 	int width = cap_width + 2 * n_border_width;
 	int height = cap_height + 2 * n_border_width;
-	int x = 500;
-	int y = 500;
-	xcb_create_window(c, win_geom->depth, new_window,
-		screen->root, x, y,
-		width,
-		height,
-		0, // border width
-		InputOutput, win_attrs->visual,
-		mask, values
-	);
-	xcb_change_property(c, XCB_PROP_MODE_REPLACE, new_window,
-		XCB_ATOM_WM_TRANSIENT_FOR, XCB_ATOM_WINDOW, 32, 1,
-		&top_window);
-	values[0] = get_atom(c, "_NET_WM_STATE_ABOVE");
-	xcb_change_property(c, XCB_PROP_MODE_REPLACE, new_window,
-		get_atom(c, "_NET_WM_STATE"), XCB_ATOM_ATOM, 32, 1,
-		&values);
-
-	xcb_size_hints_t hints;
-
-	xcb_icccm_size_hints_set_min_size(&hints, width, height);
-	xcb_icccm_size_hints_set_max_size(&hints, width, height);
-
-	xcb_icccm_set_wm_size_hints(c, new_window, XCB_ATOM_WM_NORMAL_HINTS,
-		&hints);
-
-	motif_hints_t m_hints;
-
-	m_hints.flags = 2;
-	m_hints.functions = 0;
-	m_hints.decorations = 0;
-	m_hints.input_mode = 0;
-	m_hints.status = 0;
-
-	xcb_change_property (c,
-		XCB_PROP_MODE_REPLACE,
-		new_window,
-		atom_motif_hints,
-		atom_motif_hints,
-		32,
-		5,
-		&m_hints);
-
-	xcb_map_window(c, new_window);
+	xcb_window_t new_window = create_view_window(win_geom->depth,
+		win_attrs->visual, win_attrs->colormap,
+		500, 500, width, height, black);
 
 	xcb_gcontext_t copy_gc = xcb_generate_id(c);
 	values[0] = grey;
@@ -589,6 +587,296 @@ redraw_view(view_ctx_t *v)
 			error->major_code,
 			error->minor_code);
 	}
+}
+
+void
+initialize_state_path(void)
+{
+	const char *home = getenv("HOME");
+	if (!home)
+		return;
+	char dir1[512], dir2[512];
+	snprintf(dir1, sizeof(dir1), "%s/.config", home);
+	mkdir(dir1, 0755);
+	snprintf(dir2, sizeof(dir2), "%s/.config/sniptotop", home);
+	mkdir(dir2, 0755);
+	snprintf(state_path, sizeof(state_path),
+		"%s/.config/sniptotop/state", home);
+}
+
+void
+save_state(void)
+{
+	char tmp_path[520];
+	FILE *f;
+	xcb_generic_error_t *err;
+
+	if (state_path[0] == '\0')
+		return;
+
+	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", state_path);
+	f = fopen(tmp_path, "w");
+	if (!f)
+		return;
+
+	fprintf(f, "# target_name cap_x cap_y cap_width cap_height "
+		"view_x view_y\n");
+
+	/* save connected views */
+	for (int i = 0; i < nwindows; i++) {
+		if (windows[i].type != WIN_TYPE_VIEW)
+			continue;
+		view_ctx_t *v = windows[i].ctx;
+		if (v->t->disconnected)
+			continue;
+		xcb_get_geometry_cookie_t gc =
+			xcb_get_geometry(c, v->window);
+		xcb_get_geometry_reply_t *geom =
+			xcb_get_geometry_reply(c, gc, &err);
+		if (!geom)
+			continue;
+		fprintf(f, "%s %d %d %d %d %d %d\n",
+			v->t->name,
+			v->cap_x, v->cap_y,
+			v->cap_width, v->cap_height,
+			geom->x, geom->y);
+		free(geom);
+	}
+
+	/* save disconnected views */
+	for (int i = 0; i < n_disconnected; i++) {
+		target_ctx_t *t = disconnected_targets[i];
+		for (view_ctx_t *v = t->first_view; v; v = v->next_view) {
+			xcb_get_geometry_cookie_t gc =
+				xcb_get_geometry(c, v->window);
+			xcb_get_geometry_reply_t *geom =
+				xcb_get_geometry_reply(c, gc, &err);
+			if (!geom)
+				continue;
+			fprintf(f, "%s %d %d %d %d %d %d\n",
+				t->name,
+				v->cap_x, v->cap_y,
+				v->cap_width, v->cap_height,
+				geom->x, geom->y);
+			free(geom);
+		}
+	}
+
+	fclose(f);
+	rename(tmp_path, state_path);
+}
+
+int
+find_window_by_name(const char *name, xcb_window_t *wm_win,
+	xcb_window_t *client_win)
+{
+	xcb_generic_error_t *err;
+	xcb_query_tree_cookie_t tree_cookie;
+	xcb_query_tree_reply_t *tree_reply;
+	xcb_atom_t atom_wm_name = get_atom(c, "WM_NAME");
+
+	tree_cookie = xcb_query_tree(c, screen->root);
+	tree_reply = xcb_query_tree_reply(c, tree_cookie, &err);
+	if (!tree_reply)
+		return 0;
+
+	int n = xcb_query_tree_children_length(tree_reply);
+	xcb_window_t *children = xcb_query_tree_children(tree_reply);
+
+	for (int i = 0; i < n; i++) {
+		xcb_window_t client = find_wm_window(children[i]);
+		if (client == XCB_WINDOW_NONE)
+			continue;
+
+		xcb_get_property_cookie_t pr_c;
+		xcb_get_property_reply_t *pr_r;
+
+		pr_c = xcb_get_property(c, 0, client, atom_wm_name,
+			XCB_ATOM_ANY, 0, 100);
+		pr_r = xcb_get_property_reply(c, pr_c, &err);
+		if (!pr_r)
+			continue;
+
+		int len = xcb_get_property_value_length(pr_r);
+		if (len == 0) {
+			free(pr_r);
+			continue;
+		}
+
+		char buf[512];
+		if (len >= (int)sizeof(buf))
+			len = sizeof(buf) - 1;
+		memcpy(buf, xcb_get_property_value(pr_r), len);
+		buf[len] = '\0';
+		free(pr_r);
+
+		if (strcmp(buf, name) == 0) {
+			*wm_win = children[i];
+			*client_win = client;
+			free(tree_reply);
+			return 1;
+		}
+	}
+
+	free(tree_reply);
+	return 0;
+}
+
+void
+create_disconnected_view(const char *name, int cap_x, int cap_y,
+	int cap_w, int cap_h, int view_x, int view_y)
+{
+	uint32_t values[20];
+	uint32_t black = 0xff000000;
+	uint32_t grey = 0xff808080;
+
+	int n_border_width = 2;
+	int width = cap_w + 2 * n_border_width;
+	int height = cap_h + 2 * n_border_width;
+
+	xcb_colormap_t cmap = xcb_generate_id(c);
+	xcb_create_colormap(c, XCB_COLORMAP_ALLOC_NONE, cmap,
+		screen->root, screen->root_visual);
+	xcb_window_t new_window = create_view_window(screen->root_depth,
+		screen->root_visual, cmap,
+		view_x, view_y, width, height, grey);
+
+	/* create GC on the view window itself (no target available) */
+	xcb_gcontext_t gc = xcb_generate_id(c);
+	values[0] = grey;
+	values[1] = black;
+	xcb_create_gc(c, gc, new_window,
+		XCB_GC_FOREGROUND | XCB_GC_BACKGROUND, values);
+
+	view_ctx_t *v = calloc(sizeof(view_ctx_t), 1);
+	v->window = new_window;
+	v->gc = gc;
+	v->cap_x = cap_x;
+	v->cap_y = cap_y;
+	v->cap_width = cap_w;
+	v->cap_height = cap_h;
+	add_window(new_window, WIN_TYPE_VIEW, v);
+
+	target_ctx_t *t = calloc(sizeof(target_ctx_t), 1);
+	t->name = strdup(name);
+	t->disconnected = 1;
+	t->first_view = v;
+	v->t = t;
+
+	if (n_disconnected >= MAX_DISCONNECTED)
+		fail("too many disconnected targets");
+	disconnected_targets[n_disconnected++] = t;
+}
+
+void
+restore_state(void)
+{
+	FILE *f;
+	char line[1024];
+
+	if (no_restore || state_path[0] == '\0')
+		return;
+
+	f = fopen(state_path, "r");
+	if (!f)
+		return;
+
+	while (fgets(line, sizeof(line), f)) {
+		/* strip newline */
+		int len = strlen(line);
+		if (len > 0 && line[len - 1] == '\n')
+			line[--len] = '\0';
+		if (len == 0 || line[0] == '#')
+			continue;
+
+		/* parse from the end: last 6 fields are ints,
+		 * everything before is the name */
+		int vals[6];
+		char *p = line + len;
+		int got = 0;
+		for (got = 5; got >= 0; got--) {
+			/* skip trailing spaces */
+			while (p > line && *(p - 1) == ' ')
+				p--;
+			/* find start of number */
+			while (p > line && *(p - 1) != ' ')
+				p--;
+			vals[got] = atoi(p);
+			p--; /* skip the space */
+			if (p < line)
+				break;
+		}
+		if (got > 0) {
+			deb("restore_state: failed to parse line: %s\n",
+				line);
+			continue;
+		}
+
+		/* name is everything before the space before first int */
+		/* p currently points one before the space separator */
+		int name_len = p - line;
+		if (name_len <= 0) {
+			deb("restore_state: no name in line\n");
+			continue;
+		}
+		char name[512];
+		if (name_len >= (int)sizeof(name))
+			name_len = sizeof(name) - 1;
+		memcpy(name, line, name_len);
+		name[name_len] = '\0';
+
+		deb("restore: name='%s' cap=%d,%d %dx%d view=%d,%d\n",
+			name, vals[0], vals[1], vals[2], vals[3],
+			vals[4], vals[5]);
+
+		xcb_window_t wm_win, client_win;
+		if (find_window_by_name(name, &wm_win, &client_win)) {
+			char *n = strdup(name);
+			/* create_view expects absolute coords,
+			 * but we saved cap-relative coords.
+			 * We need to reconstruct x1,y1,x2,y2 as
+			 * absolute positions on the target window.
+			 * Since create_view does cap_x = x1 - geom->x
+			 * and cap_y = y1 - geom->y, we need to add
+			 * the target geometry offset back. */
+			xcb_generic_error_t *err;
+			xcb_get_geometry_cookie_t gc =
+				xcb_get_geometry(c, wm_win);
+			xcb_get_geometry_reply_t *geom =
+				xcb_get_geometry_reply(c, gc, &err);
+			if (!geom) {
+				free(n);
+				continue;
+			}
+			int abs_x1 = vals[0] + geom->x;
+			int abs_y1 = vals[1] + geom->y;
+			int abs_x2 = abs_x1 + vals[2];
+			int abs_y2 = abs_y1 + vals[3];
+			free(geom);
+			create_view(wm_win, client_win, n,
+				abs_x1, abs_y1, abs_x2, abs_y2);
+			/* reposition to saved location */
+			uint32_t pos[2];
+			pos[0] = vals[4];
+			pos[1] = vals[5];
+			/* find the view we just created — it's the
+			 * last one added for this target */
+			int t_ix = find_window(wm_win);
+			if (t_ix >= 0) {
+				target_ctx_t *t = windows[t_ix].ctx;
+				view_ctx_t *v = t->first_view;
+				xcb_configure_window(c, v->window,
+					XCB_CONFIG_WINDOW_X |
+					XCB_CONFIG_WINDOW_Y, pos);
+			}
+		} else {
+			create_disconnected_view(name,
+				vals[0], vals[1], vals[2], vals[3],
+				vals[4], vals[5]);
+		}
+	}
+
+	fclose(f);
 }
 
 void
@@ -771,6 +1059,7 @@ handle_top_event(xcb_generic_event_t *e, void *ctx)
 				t->sel_x1, t->sel_y1, t->sel_x2, t->sel_y2);
 			if (ret != 0)
 				fail("Failed to create view\n");
+			save_state();
 		}
 	} else if (t->state == TST_SELECT && rt == XCB_MOTION_NOTIFY) {
 	       xcb_motion_notify_event_t *mv = (void *)e;
@@ -831,6 +1120,7 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 		    v->button3_pressed) {
 			deb("button 3 released\n");
 			v->button3_pressed = 0;
+			save_state();
 		}
 
 	} else if (rt == XCB_MOTION_NOTIFY) {
@@ -853,6 +1143,7 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 		    kp->detail == 119) {
 			deb("Escape pressed, closing view\n");
 			destroy_view(v);
+			save_state();
 		}
 	} else {
 		deb("view: discarding event type %d\n", rt);
@@ -923,17 +1214,51 @@ reconnect_target(target_ctx_t *t, xcb_window_t new_target,
 	/* register in window registry */
 	add_window(new_target, WIN_TYPE_TARGET, t);
 
-	/* get colormap and visual from target for GC creation */
+	/* get attributes and geometry from target */
 	xcb_get_window_attributes_cookie_t attr_cookie;
 	xcb_get_window_attributes_reply_t *win_attrs;
+	xcb_get_geometry_cookie_t geom_cookie;
+	xcb_get_geometry_reply_t *target_geom;
 
 	attr_cookie = xcb_get_window_attributes(c, new_target);
 	win_attrs = xcb_get_window_attributes_reply(c, attr_cookie, &err);
+	geom_cookie = xcb_get_geometry(c, new_target);
+	target_geom = xcb_get_geometry_reply(c, geom_cookie, &err);
 
 	/* recreate GCs and redraw all views */
 	for (v = t->first_view; v != NULL; v = v->next_view) {
 		uint32_t grey = 0xff808080;
 		uint32_t black = 0xff000000;
+
+		/* check if view window depth matches target */
+		xcb_get_geometry_cookie_t vg_c =
+			xcb_get_geometry(c, v->window);
+		xcb_get_geometry_reply_t *vg =
+			xcb_get_geometry_reply(c, vg_c, &err);
+		if (vg && target_geom && win_attrs &&
+		    vg->depth != target_geom->depth) {
+			int vx = vg->x, vy = vg->y;
+			int vw = vg->width, vh = vg->height;
+
+			deb("depth mismatch %d vs %d, "
+				"recreating view window\n",
+				vg->depth, target_geom->depth);
+
+			rem_window(v->window);
+			xcb_destroy_window(c, v->window);
+
+			xcb_window_t nw = create_view_window(
+				target_geom->depth,
+				win_attrs->visual,
+				win_attrs->colormap,
+				vx, vy, vw, vh, black);
+			v->window = nw;
+			add_window(nw, WIN_TYPE_VIEW, v);
+		}
+		free(vg);
+
+		if (v->gc)
+			xcb_free_gc(c, v->gc);
 		v->gc = xcb_generate_id(c);
 		values[0] = grey;
 		values[1] = black;
@@ -944,6 +1269,7 @@ reconnect_target(target_ctx_t *t, xcb_window_t new_target,
 		redraw_view(v);
 	}
 
+	free(target_geom);
 	if (win_attrs)
 		free(win_attrs);
 
@@ -1156,13 +1482,16 @@ main(int argc, char **argv)
 {
 	xcb_generic_event_t *e;
 	int opt;
-	while ((opt = getopt(argc, argv, "d")) != -1) {
+	while ((opt = getopt(argc, argv, "dn")) != -1) {
 		switch (opt) {
 		case 'd':
 			debug = 1;
 			break;
+		case 'n':
+			no_restore = 1;
+			break;
 		default:
-			fprintf(stderr, "Usage: %s [-d]\n", argv[0]);
+			fprintf(stderr, "Usage: %s [-d] [-n]\n", argv[0]);
 			exit(EXIT_FAILURE);
 		}
 	}
@@ -1173,9 +1502,11 @@ main(int argc, char **argv)
 	       "To move a snip, hold down the right mouse button and drag.\n"
 	       "To close a snip, focus it and press escape.\n");
 
+	initialize_state_path();
 	initialize_xcb();
 	initialize_xdamage();
 	initialize_top_window();
+	restore_state();
 
 	/* subscribe to root events to detect new windows for reconnection */
 	uint32_t root_mask = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
