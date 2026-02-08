@@ -41,6 +41,10 @@ struct {
 	void *ctx;
 } windows[MAX_WINDOWS];
 
+int n_disconnected = 0;
+#define MAX_DISCONNECTED 100
+void *disconnected_targets[MAX_DISCONNECTED];
+
 struct view_ctx;
 typedef struct {
 	xcb_window_t target;
@@ -48,6 +52,7 @@ typedef struct {
 	struct view_ctx *first_view;
 	xcb_damage_damage_t damage;
 	char *name;
+	int disconnected;
 } target_ctx_t;
 
 typedef struct view_ctx {
@@ -526,19 +531,31 @@ destroy_view(view_ctx_t *v)
 	if (!cur)
 		fail("internal error, view not found in target's list");
 
-	xcb_free_gc(c, v->gc);
+	if (v->gc)
+		xcb_free_gc(c, v->gc);
 	rem_window(v->window);
 	xcb_destroy_window(c, v->window);
 
 	// if no more views for this target, free target as well
 	if (t->first_view == NULL) {
-		uint32_t eventmask = 0;
-		xcb_change_window_attributes(c, t->target, XCB_CW_EVENT_MASK,
-			&eventmask);
+		if (t->disconnected) {
+			/* remove from disconnected list */
+			for (int i = 0; i < n_disconnected; i++) {
+				if (disconnected_targets[i] == t) {
+					disconnected_targets[i] =
+						disconnected_targets[--n_disconnected];
+					break;
+				}
+			}
+		} else {
+			uint32_t eventmask = 0;
+			xcb_change_window_attributes(c, t->target,
+				XCB_CW_EVENT_MASK, &eventmask);
+			xcb_damage_destroy(c, t->damage);
+			rem_window(t->target);
+		}
 		deb("No more views for target window 0x%x\n", t->target);
 		free(t->name);
-		xcb_damage_destroy(c, t->damage);
-		rem_window(t->target);
 		free(t);
 	}
 	free(v);
@@ -549,6 +566,9 @@ redraw_view(view_ctx_t *v)
 {
 	xcb_void_cookie_t v_cookie;
 	xcb_generic_error_t *error;
+
+	if (v->t->disconnected)
+		return;
 
 	deb("Redrawing view window 0x%x from target 0x%x "
 		"capture area %d,%d %dx%d\n",
@@ -789,7 +809,8 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 	} else if (rt == XCB_BUTTON_PRESS) {
 		xcb_button_press_event_t *bp = (void *)e;
 		deb("button press event, detail %d\n", bp->detail);
-		if (bp->detail == XCB_BUTTON_INDEX_1) {
+		if (bp->detail == XCB_BUTTON_INDEX_1 &&
+		    !v->t->disconnected) {
 			deb("raise window 0x%x\n", v->window);
 			/* left button, raise target window */
 			uint32_t values[1];
@@ -836,6 +857,156 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 	} else {
 		deb("view: discarding event type %d\n", rt);
 	}
+}
+
+void
+disconnect_target(target_ctx_t *t)
+{
+	view_ctx_t *v;
+
+	deb("disconnecting target 0x%x name '%s'\n", t->target, t->name);
+
+	/* remove target from window registry */
+	rem_window(t->target);
+
+	/* destroy damage object */
+	xcb_damage_destroy(c, t->damage);
+	t->damage = 0;
+
+	t->disconnected = 1;
+
+	/* blank all views and free their GCs */
+	for (v = t->first_view; v != NULL; v = v->next_view) {
+		xcb_rectangle_t r = {
+			.x = border_width,
+			.y = border_width,
+			.width = v->cap_width,
+			.height = v->cap_height,
+		};
+		xcb_poly_fill_rectangle(c, v->window, v->gc, 1, &r);
+		xcb_free_gc(c, v->gc);
+		v->gc = 0;
+	}
+
+	/* add to disconnected list */
+	if (n_disconnected >= MAX_DISCONNECTED)
+		fail("too many disconnected targets");
+	disconnected_targets[n_disconnected++] = t;
+}
+
+void
+reconnect_target(target_ctx_t *t, xcb_window_t new_target,
+	xcb_window_t new_wm_target)
+{
+	uint32_t values[5];
+	view_ctx_t *v;
+	xcb_generic_error_t *err;
+
+	deb("reconnecting target name '%s' to window 0x%x\n",
+		t->name, new_target);
+
+	t->target = new_target;
+	t->wm_target = new_wm_target;
+	t->disconnected = 0;
+
+	/* subscribe to events on new target */
+	values[0] = XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+		XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
+	xcb_change_window_attributes(c, new_target, XCB_CW_EVENT_MASK,
+		values);
+
+	/* create new damage object */
+	t->damage = xcb_generate_id(c);
+	xcb_damage_create(c, t->damage, new_target,
+		XCB_DAMAGE_REPORT_LEVEL_RAW_RECTANGLES);
+
+	/* register in window registry */
+	add_window(new_target, WIN_TYPE_TARGET, t);
+
+	/* get colormap and visual from target for GC creation */
+	xcb_get_window_attributes_cookie_t attr_cookie;
+	xcb_get_window_attributes_reply_t *win_attrs;
+
+	attr_cookie = xcb_get_window_attributes(c, new_target);
+	win_attrs = xcb_get_window_attributes_reply(c, attr_cookie, &err);
+
+	/* recreate GCs and redraw all views */
+	for (v = t->first_view; v != NULL; v = v->next_view) {
+		uint32_t grey = 0xff808080;
+		uint32_t black = 0xff000000;
+		v->gc = xcb_generate_id(c);
+		values[0] = grey;
+		values[1] = black;
+		values[2] = XCB_SUBWINDOW_MODE_INCLUDE_INFERIORS;
+		xcb_create_gc(c, v->gc, new_target,
+			XCB_GC_FOREGROUND | XCB_GC_BACKGROUND |
+			XCB_GC_SUBWINDOW_MODE, values);
+		redraw_view(v);
+	}
+
+	if (win_attrs)
+		free(win_attrs);
+
+	/* remove from disconnected list */
+	for (int i = 0; i < n_disconnected; i++) {
+		if (disconnected_targets[i] == t) {
+			disconnected_targets[i] =
+				disconnected_targets[--n_disconnected];
+			break;
+		}
+	}
+}
+
+void
+check_new_window(xcb_window_t window)
+{
+	xcb_generic_error_t *err;
+	xcb_window_t client;
+	xcb_get_property_cookie_t pr_c;
+	xcb_get_property_reply_t *pr_r;
+	xcb_atom_t atom_wm_name;
+	char *name;
+	int len;
+
+	if (n_disconnected == 0)
+		return;
+
+	client = find_wm_window(window);
+	if (client == XCB_WINDOW_NONE)
+		return;
+
+	atom_wm_name = get_atom(c, "WM_NAME");
+	pr_c = xcb_get_property(c, 0, client, atom_wm_name,
+		XCB_ATOM_ANY, 0, 100);
+	pr_r = xcb_get_property_reply(c, pr_c, &err);
+	if (!pr_r)
+		return;
+
+	len = xcb_get_property_value_length(pr_r);
+	if (len == 0) {
+		free(pr_r);
+		return;
+	}
+
+	name = malloc(len + 1);
+	memcpy(name, xcb_get_property_value(pr_r), len);
+	name[len] = '\0';
+	free(pr_r);
+
+	deb("new window 0x%x (client 0x%x) name '%s'\n",
+		window, client, name);
+
+	for (int i = 0; i < n_disconnected; i++) {
+		target_ctx_t *t = disconnected_targets[i];
+		if (strcmp(t->name, name) == 0) {
+			deb("matched disconnected target '%s'\n", name);
+			free(name);
+			reconnect_target(t, client, window);
+			return;
+		}
+	}
+
+	free(name);
 }
 
 void
@@ -887,6 +1058,12 @@ handle_target_event(xcb_generic_event_t *e, void *ctx)
 				"event 0x%x, my window is 0x%x\n",
 				um->window, um->event, t->target);
 		}
+	} else if (rt == XCB_DESTROY_NOTIFY) {
+		xcb_destroy_notify_event_t *dn = (void *)e;
+		if (dn->window == t->target) {
+			deb("target window 0x%x destroyed\n", t->target);
+			disconnect_target(t);
+		}
 	}
 }
 
@@ -897,6 +1074,25 @@ handle_event(xcb_generic_event_t *e)
 	int i;
 
 	int rt = e->response_type & ~0x80;
+
+	/* intercept MAP_NOTIFY on root for reconnection */
+	if (rt == XCB_MAP_NOTIFY) {
+		xcb_map_notify_event_t *mn = (void *)e;
+		if (mn->event == screen->root) {
+			deb("map notify on root for window 0x%x\n",
+				mn->window);
+			check_new_window(mn->window);
+			return;
+		}
+	}
+
+	/* filter other root SubstructureNotify events we don't handle */
+	if (rt == XCB_CREATE_NOTIFY || rt == XCB_REPARENT_NOTIFY ||
+	    rt == XCB_CONFIGURE_NOTIFY) {
+		deb("ignoring root event type %d\n", rt);
+		return;
+	}
+
 	/* extract window from event */
 	if (rt == XCB_EXPOSE) {
 		win = ((xcb_expose_event_t *)e)->window;
@@ -911,9 +1107,20 @@ handle_event(xcb_generic_event_t *e)
 	} else if (rt == XCB_MOTION_NOTIFY) {
 		win = ((xcb_motion_notify_event_t *)e)->event;
 	} else if (rt == XCB_UNMAP_NOTIFY) {
-		win = ((xcb_unmap_notify_event_t *)e)->event;
-		deb("unmap notify for window 0x%x event 0x%x\n", win,
-			((xcb_unmap_notify_event_t *)e)->event);
+		xcb_unmap_notify_event_t *um = (void *)e;
+		deb("unmap notify for window 0x%x event 0x%x\n",
+			um->window, um->event);
+		/* root SubstructureNotify: route by child window */
+		if (um->event == screen->root)
+			win = um->window;
+		else
+			win = um->event;
+	} else if (rt == XCB_DESTROY_NOTIFY) {
+		xcb_destroy_notify_event_t *dn = (void *)e;
+		deb("destroy notify for window 0x%x event 0x%x\n",
+			dn->window, dn->event);
+		/* route by the destroyed window, not the event window */
+		win = dn->window;
 	} else if (rt == damage_notify_event) {
 		win = ((xcb_damage_notify_event_t *)e)->drawable;
 	} else {
@@ -922,8 +1129,11 @@ handle_event(xcb_generic_event_t *e)
 	}
 
 	i = find_window(win);
-	if (i < 0)
-		fail("event for unknown window 0x%x\n", win);
+	if (i < 0) {
+		deb("event type %d for unknown window 0x%x, ignoring\n",
+			rt, win);
+		return;
+	}
 
 	switch (windows[i].type) {
 	case WIN_TYPE_TOP:
@@ -966,6 +1176,11 @@ main(int argc, char **argv)
 	initialize_xcb();
 	initialize_xdamage();
 	initialize_top_window();
+
+	/* subscribe to root events to detect new windows for reconnection */
+	uint32_t root_mask = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
+	xcb_change_window_attributes(c, screen->root, XCB_CW_EVENT_MASK,
+		&root_mask);
 
 	/* main loop */
 	xcb_flush(c);
