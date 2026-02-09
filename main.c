@@ -16,6 +16,7 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <poll.h>
 
 int debug = 0;
 int no_restore = 0;
@@ -44,6 +45,22 @@ struct {
 	win_type_t type;
 	void *ctx;
 } windows[MAX_WINDOWS];
+
+xcb_window_t tooltip_window = XCB_WINDOW_NONE;
+xcb_gcontext_t tooltip_gc;
+struct timeval hover_start;
+xcb_window_t hover_window = XCB_WINDOW_NONE;
+int hover_x, hover_y;
+
+static const char *tooltip_lines[] = {
+	"To add snips, click the \"plus\" in the main window.",
+	"Then select a window by clicking on it.",
+	"Then drag a rectangle with the left mouse button.",
+	"To move a snip, right-click and drag.",
+	"To close a snip, focus it and press escape.",
+	"Arrow keys/hjkl resize (lower-right), shift: upper-left.",
+};
+#define TOOLTIP_NLINES (sizeof(tooltip_lines) / sizeof(tooltip_lines[0]))
 
 int n_disconnected = 0;
 #define MAX_DISCONNECTED 100
@@ -339,7 +356,9 @@ initialize_top_window(void)
 	values[0] = screen->white_pixel;
 	values[1] = XCB_EVENT_MASK_EXPOSURE |
 		XCB_EVENT_MASK_BUTTON_PRESS |
-		XCB_EVENT_MASK_BUTTON_RELEASE;
+		XCB_EVENT_MASK_BUTTON_RELEASE |
+		XCB_EVENT_MASK_ENTER_WINDOW |
+		XCB_EVENT_MASK_LEAVE_WINDOW;
 	xcb_create_window(c, XCB_COPY_FROM_PARENT, top_window,
 		screen->root, 0, 0,
 		150, 150,
@@ -402,7 +421,9 @@ create_view_window(uint8_t depth, xcb_visualid_t visual,
 		XCB_EVENT_MASK_BUTTON_RELEASE |
 		XCB_EVENT_MASK_KEY_PRESS |
 		XCB_EVENT_MASK_BUTTON_3_MOTION |
-		XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+		XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+		XCB_EVENT_MASK_ENTER_WINDOW |
+		XCB_EVENT_MASK_LEAVE_WINDOW;
 	values[4] = colormap;
 	xcb_create_window(c, depth, win,
 		screen->root, x, y, w, h,
@@ -925,6 +946,79 @@ restore_state(void)
 	}
 
 	fclose(f);
+}
+
+void
+hide_tooltip(void)
+{
+	if (tooltip_window != XCB_WINDOW_NONE) {
+		xcb_destroy_window(c, tooltip_window);
+		tooltip_window = XCB_WINDOW_NONE;
+	}
+}
+
+void
+show_tooltip(int root_x, int root_y)
+{
+	uint32_t mask, values[5];
+	int char_w = 7, line_h = 13, pad = 4;
+	int max_len = 0;
+
+	/* allocate light yellow (#FFFFE0) */
+	xcb_alloc_color_cookie_t ac = xcb_alloc_color(c,
+		screen->default_colormap, 0xffff, 0xffff, 0xe0e0);
+	xcb_alloc_color_reply_t *ar = xcb_alloc_color_reply(c, ac, NULL);
+	uint32_t bg_pixel = ar ? ar->pixel : screen->white_pixel;
+	free(ar);
+
+	for (int i = 0; i < (int)TOOLTIP_NLINES; i++) {
+		int len = strlen(tooltip_lines[i]);
+		if (len > max_len)
+			max_len = len;
+	}
+
+	int win_w = max_len * char_w + 2 * pad + 2;
+	int win_h = TOOLTIP_NLINES * line_h + 2 * pad + 2;
+	int x = root_x + 15;
+	int y = root_y + 15;
+
+	/* clamp to screen edges */
+	if (x + win_w > screen->width_in_pixels)
+		x = screen->width_in_pixels - win_w;
+	if (y + win_h > screen->height_in_pixels)
+		y = root_y - win_h - 5;
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+
+	tooltip_window = xcb_generate_id(c);
+	mask = XCB_CW_BACK_PIXEL |
+		XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
+	values[0] = bg_pixel;
+	values[1] = 1;
+	values[2] = 0; /* no events on tooltip */
+	xcb_create_window(c, XCB_COPY_FROM_PARENT, tooltip_window,
+		screen->root, x, y, win_w, win_h,
+		0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+		XCB_COPY_FROM_PARENT, mask, values);
+
+	tooltip_gc = xcb_generate_id(c);
+	values[0] = screen->black_pixel;
+	values[1] = bg_pixel;
+	xcb_create_gc(c, tooltip_gc, tooltip_window,
+		XCB_GC_FOREGROUND | XCB_GC_BACKGROUND, values);
+
+	xcb_map_window(c, tooltip_window);
+
+	/* draw border manually */
+	xcb_rectangle_t border = { 0, 0, win_w - 1, win_h - 1 };
+	xcb_poly_rectangle(c, tooltip_window, tooltip_gc, 1, &border);
+
+	for (int i = 0; i < (int)TOOLTIP_NLINES; i++) {
+		int len = strlen(tooltip_lines[i]);
+		xcb_image_text_8(c, len, tooltip_window, tooltip_gc,
+			pad + 1, pad + 1 + (i + 1) * line_h - 2,
+			tooltip_lines[i]);
+	}
 }
 
 void
@@ -1572,12 +1666,33 @@ handle_event(xcb_generic_event_t *e)
 			dn->window, dn->event);
 		/* route by the destroyed window, not the event window */
 		win = dn->window;
+	} else if (rt == XCB_ENTER_NOTIFY) {
+		win = ((xcb_enter_notify_event_t *)e)->event;
+	} else if (rt == XCB_LEAVE_NOTIFY) {
+		win = ((xcb_leave_notify_event_t *)e)->event;
 	} else if (rt == damage_notify_event) {
 		win = ((xcb_damage_notify_event_t *)e)->drawable;
 	} else {
 		deb("unhandled event type %d\n", rt);
 		return;
 	}
+
+	/* handle hover tracking for tooltips */
+	if (rt == XCB_ENTER_NOTIFY) {
+		xcb_enter_notify_event_t *en = (void *)e;
+		hover_window = en->event;
+		hover_x = en->root_x;
+		hover_y = en->root_y;
+		gettimeofday(&hover_start, NULL);
+		return;
+	}
+	if (rt == XCB_LEAVE_NOTIFY) {
+		hover_window = XCB_WINDOW_NONE;
+		hide_tooltip();
+		return;
+	}
+	if (rt == XCB_BUTTON_PRESS)
+		hide_tooltip();
 
 	i = find_window(win);
 	if (i < 0) {
@@ -1642,10 +1757,32 @@ main(int argc, char **argv)
 
 	/* main loop */
 	xcb_flush(c);
-	while ((e = xcb_wait_for_event(c))) {
-		deb("got event, response_type %d\n", e->response_type);
-		handle_event(e);
-		free(e);
+	int xfd = xcb_get_file_descriptor(c);
+	struct pollfd pfd = { .fd = xfd, .events = POLLIN };
+
+	while (1) {
+		int timeout_ms = (hover_window != XCB_WINDOW_NONE &&
+				  tooltip_window == XCB_WINDOW_NONE) ? 500 : -1;
+		poll(&pfd, 1, timeout_ms);
+
+		while ((e = xcb_poll_for_event(c))) {
+			deb("got event, response_type %d\n", e->response_type);
+			handle_event(e);
+			free(e);
+		}
+		if (xcb_connection_has_error(c))
+			break;
+
+		/* check hover timeout */
+		if (hover_window != XCB_WINDOW_NONE &&
+		    tooltip_window == XCB_WINDOW_NONE) {
+			struct timeval now;
+			gettimeofday(&now, NULL);
+			long elapsed_ms = (now.tv_sec - hover_start.tv_sec) * 1000 +
+				(now.tv_usec - hover_start.tv_usec) / 1000;
+			if (elapsed_ms >= 3000)
+				show_tooltip(hover_x, hover_y);
+		}
 		xcb_flush(c);
 	}
 
