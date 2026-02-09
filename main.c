@@ -679,6 +679,47 @@ save_state(void)
 	rename(tmp_path, state_path);
 }
 
+/*
+ * get the window title: try _NET_WM_NAME first, fall back to WM_NAME.
+ * returns a malloc'd string or NULL.
+ */
+char *
+get_window_title(xcb_window_t win)
+{
+	xcb_generic_error_t *err;
+	xcb_get_property_cookie_t pr_c;
+	xcb_get_property_reply_t *pr_r;
+	xcb_atom_t atom_net_wm_name = get_atom(c, "_NET_WM_NAME");
+	xcb_atom_t atom_utf8 = get_atom(c, "UTF8_STRING");
+
+	pr_c = xcb_get_property(c, 0, win, atom_net_wm_name,
+		atom_utf8, 0, 256);
+	pr_r = xcb_get_property_reply(c, pr_c, &err);
+	if (pr_r && xcb_get_property_value_length(pr_r) > 0) {
+		int len = xcb_get_property_value_length(pr_r);
+		char *name = malloc(len + 1);
+		memcpy(name, xcb_get_property_value(pr_r), len);
+		name[len] = '\0';
+		free(pr_r);
+		return name;
+	}
+	free(pr_r);
+
+	pr_c = xcb_get_property(c, 0, win, XCB_ATOM_WM_NAME,
+		XCB_ATOM_ANY, 0, 256);
+	pr_r = xcb_get_property_reply(c, pr_c, &err);
+	if (pr_r && xcb_get_property_value_length(pr_r) > 0) {
+		int len = xcb_get_property_value_length(pr_r);
+		char *name = malloc(len + 1);
+		memcpy(name, xcb_get_property_value(pr_r), len);
+		name[len] = '\0';
+		free(pr_r);
+		return name;
+	}
+	free(pr_r);
+	return NULL;
+}
+
 int
 find_window_by_name(const char *name, xcb_window_t *wm_win,
 	xcb_window_t *client_win)
@@ -686,7 +727,6 @@ find_window_by_name(const char *name, xcb_window_t *wm_win,
 	xcb_generic_error_t *err;
 	xcb_query_tree_cookie_t tree_cookie;
 	xcb_query_tree_reply_t *tree_reply;
-	xcb_atom_t atom_wm_name = get_atom(c, "WM_NAME");
 
 	tree_cookie = xcb_query_tree(c, screen->root);
 	tree_reply = xcb_query_tree_reply(c, tree_cookie, &err);
@@ -701,34 +741,18 @@ find_window_by_name(const char *name, xcb_window_t *wm_win,
 		if (client == XCB_WINDOW_NONE)
 			continue;
 
-		xcb_get_property_cookie_t pr_c;
-		xcb_get_property_reply_t *pr_r;
-
-		pr_c = xcb_get_property(c, 0, client, atom_wm_name,
-			XCB_ATOM_ANY, 0, 100);
-		pr_r = xcb_get_property_reply(c, pr_c, &err);
-		if (!pr_r)
+		char *cls = get_window_title(client);
+		if (!cls)
 			continue;
 
-		int len = xcb_get_property_value_length(pr_r);
-		if (len == 0) {
-			free(pr_r);
-			continue;
-		}
-
-		char buf[512];
-		if (len >= (int)sizeof(buf))
-			len = sizeof(buf) - 1;
-		memcpy(buf, xcb_get_property_value(pr_r), len);
-		buf[len] = '\0';
-		free(pr_r);
-
-		if (strcmp(buf, name) == 0) {
+		if (strcmp(cls, name) == 0) {
 			*wm_win = children[i];
 			*client_win = client;
+			free(cls);
 			free(tree_reply);
 			return 1;
 		}
+		free(cls);
 	}
 
 	free(tree_reply);
@@ -993,33 +1017,17 @@ handle_top_event(xcb_generic_event_t *e, void *ctx)
 					XCB_CONFIG_WINDOW_STACK_MODE, values);
 			}
 			/*
-			 * get window name
+			 * get window class name
 			 */
-			xcb_get_property_cookie_t pr_c;
-			xcb_get_property_reply_t *pr_r;
-			xcb_atom_t atom_wm_name = get_atom(c, "WM_NAME");
-			pr_c = xcb_get_property(c, 0, t->sel_wm_target,
-				atom_wm_name, XCB_ATOM_ANY, 0, 100);
-			pr_r = xcb_get_property_reply(c, pr_c, &err);
-			if (!pr_r) {
-				deb("Failed to get window name\n");
+			char *name = get_window_title(t->sel_wm_target);
+			if (!name) {
+				deb("Window with no title\n");
 				t->state = TST_IDLE;
 				return;
 			}
-			int len = xcb_get_property_value_length(pr_r);
-			if (len == 0) {
-				deb("Window with no name\n");
-				t->state = TST_IDLE;
-				return;
-			}
-
-			char *name = malloc(len + 1);
-			memcpy(name, xcb_get_property_value(pr_r), len);
-			name[len] = '\0';
 			t->sel_name = name;
-			deb("Selected window 0x%x name '%s'\n",
+			deb("Selected window 0x%x title '%s'\n",
 				t->sel_target, name);
-			free (pr_r);
 
 			/*
 			 * regrab the pointer, now confining it to the
@@ -1413,13 +1421,8 @@ reconnect_target(target_ctx_t *t, xcb_window_t new_target,
 void
 check_new_window(xcb_window_t window)
 {
-	xcb_generic_error_t *err;
 	xcb_window_t client;
-	xcb_get_property_cookie_t pr_c;
-	xcb_get_property_reply_t *pr_r;
-	xcb_atom_t atom_wm_name;
 	char *name;
-	int len;
 
 	if (n_disconnected == 0)
 		return;
@@ -1428,25 +1431,11 @@ check_new_window(xcb_window_t window)
 	if (client == XCB_WINDOW_NONE)
 		return;
 
-	atom_wm_name = get_atom(c, "WM_NAME");
-	pr_c = xcb_get_property(c, 0, client, atom_wm_name,
-		XCB_ATOM_ANY, 0, 100);
-	pr_r = xcb_get_property_reply(c, pr_c, &err);
-	if (!pr_r)
+	name = get_window_title(client);
+	if (!name)
 		return;
 
-	len = xcb_get_property_value_length(pr_r);
-	if (len == 0) {
-		free(pr_r);
-		return;
-	}
-
-	name = malloc(len + 1);
-	memcpy(name, xcb_get_property_value(pr_r), len);
-	name[len] = '\0';
-	free(pr_r);
-
-	deb("new window 0x%x (client 0x%x) name '%s'\n",
+	deb("new window 0x%x (client 0x%x) title '%s'\n",
 		window, client, name);
 
 	for (int i = 0; i < n_disconnected; i++) {
@@ -1454,7 +1443,7 @@ check_new_window(xcb_window_t window)
 		if (strcmp(t->name, name) == 0) {
 			deb("matched disconnected target '%s'\n", name);
 			free(name);
-			reconnect_target(t, client, window);
+			reconnect_target(t, window, client);
 			return;
 		}
 	}
