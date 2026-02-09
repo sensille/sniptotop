@@ -394,7 +394,8 @@ create_view_window(uint8_t depth, xcb_visualid_t visual,
 		get_atom(c, "_NET_WM_STATE"), XCB_ATOM_ATOM, 32, 1,
 		&values);
 
-	xcb_size_hints_t hints;
+	xcb_size_hints_t hints = {0};
+	xcb_icccm_size_hints_set_position(&hints, 1, x, y);
 	xcb_icccm_size_hints_set_min_size(&hints, w, h);
 	xcb_icccm_size_hints_set_max_size(&hints, w, h);
 	xcb_icccm_set_wm_size_hints(c, win,
