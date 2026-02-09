@@ -92,6 +92,8 @@ typedef struct {
 	int sel_y1;
 	int sel_x2;
 	int sel_y2;
+	xcb_window_t sel_overlay;
+	xcb_colormap_t sel_cmap;
 } top_ctx_t;
 
 typedef struct {
@@ -184,6 +186,25 @@ get_cursor(uint16_t ch)
 		ch, ch + 1, 0, 0, 0, 0xffff, 0xffff, 0xffff);
 
 	return cursor;
+}
+
+xcb_visualtype_t *
+find_argb_visual(void)
+{
+	xcb_depth_iterator_t di;
+
+	di = xcb_screen_allowed_depths_iterator(screen);
+	for (; di.rem; xcb_depth_next(&di)) {
+		if (di.data->depth != 32)
+			continue;
+		xcb_visualtype_iterator_t vi;
+		vi = xcb_depth_visuals_iterator(di.data);
+		for (; vi.rem; xcb_visualtype_next(&vi)) {
+			if (vi.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR)
+				return vi.data;
+		}
+	}
+	return NULL;
 }
 
 /*
@@ -354,6 +375,7 @@ initialize_top_window(void)
 	t->window = top_window;
 	t->gc = gc;
 	t->state = TST_IDLE;
+	t->sel_overlay = XCB_WINDOW_NONE;
 	add_window(top_window, WIN_TYPE_TOP, t);
 }
 
@@ -1017,22 +1039,34 @@ handle_top_event(xcb_generic_event_t *e, void *ctx)
 			gr_r = xcb_grab_pointer_reply (c, gr_c, &err);
 			if (gr_r->status != XCB_GRAB_STATUS_SUCCESS)
 				fail("grabbing mouse failed");
-#if 0
-			xcb_window_t overlay = xcb_generate_id(dpy);
-			uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_OVERRIDE_REDIRECT |
-				XCB_CW_EVENT_MASK;
-			uint32_t values[3];
-			values[0] = screen->black_pixel;
-			values[1] = 1; // override-redirect
-			values[2] = XCB_EVENT_MASK_EXPOSURE;
-			xcb_create_window(dpy, XCB_COPY_FROM_PARENT, overlay,
-				target_win, 0, 0,
-				100, 100,
-				0,
-				InputOutput, XCB_COPY_FROM_PARENT,
-				mask, values
-			);
-#endif
+			xcb_visualtype_t *argb_vis = find_argb_visual();
+			if (argb_vis) {
+				t->sel_cmap = xcb_generate_id(c);
+				xcb_create_colormap(c, XCB_COLORMAP_ALLOC_NONE,
+					t->sel_cmap, screen->root,
+					argb_vis->visual_id);
+				t->sel_overlay = xcb_generate_id(c);
+				uint32_t ov_mask =
+					XCB_CW_BACK_PIXEL |
+					XCB_CW_BORDER_PIXEL |
+					XCB_CW_OVERRIDE_REDIRECT |
+					XCB_CW_COLORMAP;
+				uint32_t ov_vals[4];
+				ov_vals[0] = 0x400060c0;
+				ov_vals[1] = 0;
+				ov_vals[2] = 1;
+				ov_vals[3] = t->sel_cmap;
+				xcb_create_window(c, 32, t->sel_overlay,
+					screen->root,
+					t->sel_x1, t->sel_y1, 1, 1, 0,
+					XCB_WINDOW_CLASS_INPUT_OUTPUT,
+					argb_vis->visual_id,
+					ov_mask, ov_vals);
+				xcb_map_window(c, t->sel_overlay);
+				xcb_flush(c);
+			} else {
+				t->sel_overlay = XCB_WINDOW_NONE;
+			}
 		}
 	} else if (t->state == TST_SELECT && rt == XCB_BUTTON_RELEASE) {
 	       xcb_button_release_event_t *br = (void *)e;
@@ -1042,6 +1076,11 @@ handle_top_event(xcb_generic_event_t *e, void *ctx)
 			t->sel_x2 = br->root_x;
 			t->sel_y2 = br->root_y;
 			xcb_ungrab_pointer(c, XCB_TIME_CURRENT_TIME);
+			if (t->sel_overlay != XCB_WINDOW_NONE) {
+				xcb_destroy_window(c, t->sel_overlay);
+				xcb_free_colormap(c, t->sel_cmap);
+				t->sel_overlay = XCB_WINDOW_NONE;
+			}
 			t->state = TST_IDLE;
 			if (t->sel_x2 < t->sel_x1) {
 				int tmp = t->sel_x1;
@@ -1064,7 +1103,20 @@ handle_top_event(xcb_generic_event_t *e, void *ctx)
 	       xcb_motion_notify_event_t *mv = (void *)e;
 	       deb("motion notify, root %d event %d root_xy %d,%d\n",
 		       mv->root, mv->event, mv->root_x, mv->root_y);
-	       /* draw selection rectangle */
+	       if (t->sel_overlay != XCB_WINDOW_NONE) {
+		       int x = t->sel_x1 < mv->root_x ? t->sel_x1 : mv->root_x;
+		       int y = t->sel_y1 < mv->root_y ? t->sel_y1 : mv->root_y;
+		       int w = abs(mv->root_x - t->sel_x1);
+		       int h = abs(mv->root_y - t->sel_y1);
+		       if (w < 1) w = 1;
+		       if (h < 1) h = 1;
+		       uint32_t ov_cfg[] = { x, y, w, h };
+		       xcb_configure_window(c, t->sel_overlay,
+			       XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+			       XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+			       ov_cfg);
+		       xcb_flush(c);
+	       }
 	}
 
 	if (t->state == TST_SELECT)
