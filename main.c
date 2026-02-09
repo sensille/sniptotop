@@ -62,6 +62,8 @@ static const char *tooltip_lines[] = {
 };
 #define TOOLTIP_NLINES (sizeof(tooltip_lines) / sizeof(tooltip_lines[0]))
 
+int notify_flashing_count = 0;
+
 int n_disconnected = 0;
 #define MAX_DISCONNECTED 100
 void *disconnected_targets[MAX_DISCONNECTED];
@@ -95,6 +97,9 @@ typedef struct view_ctx {
 	int dock_mouse_y;
 	int dock_view_x;
 	int dock_view_y;
+	int notify;          /* notify mode enabled (green border) */
+	int notify_flash;    /* content changed, flashing active */
+	struct timeval notify_flash_start;  /* when flashing started */
 	struct view_ctx *next_view;
 } view_ctx_t;
 
@@ -129,6 +134,7 @@ typedef struct {
 
 xcb_atom_t get_atom(xcb_connection_t *c, const char *name);
 xcb_window_t find_wm_window(xcb_window_t win);
+void set_border_color(view_ctx_t *v, uint32_t color);
 
 void
 deb(const char *msg, ...)
@@ -587,6 +593,9 @@ destroy_view(view_ctx_t *v)
 	if (!cur)
 		fail("internal error, view not found in target's list");
 
+	if (v->notify_flash)
+		notify_flashing_count--;
+
 	if (v->gc)
 		xcb_free_gc(c, v->gc);
 	rem_window(v->window);
@@ -640,10 +649,12 @@ redraw_view(view_ctx_t *v)
 		v->cap_width, v->cap_height);
 
 	if ((error = xcb_request_check(c, v_cookie))) {
-		fail("Error code %d major %d minor %d\n",
+		deb("redraw_view: error code %d major %d minor %d "
+			"(target 0x%x probably gone)\n",
 			error->error_code,
 			error->major_code,
 			error->minor_code);
+		free(error);
 	}
 }
 
@@ -677,7 +688,7 @@ save_state(void)
 		return;
 
 	fprintf(f, "# target_name cap_x cap_y cap_width cap_height "
-		"view_x view_y\n");
+		"view_x view_y notify\n");
 
 	/* save connected views */
 	for (int i = 0; i < nwindows; i++) {
@@ -686,22 +697,24 @@ save_state(void)
 		view_ctx_t *v = windows[i].ctx;
 		if (v->t->disconnected)
 			continue;
-		fprintf(f, "%s %d %d %d %d %d %d\n",
+		fprintf(f, "%s %d %d %d %d %d %d %d\n",
 			v->t->name,
 			v->cap_x, v->cap_y,
 			v->cap_width, v->cap_height,
-			v->view_x, v->view_y);
+			v->view_x, v->view_y,
+			v->notify);
 	}
 
 	/* save disconnected views */
 	for (int i = 0; i < n_disconnected; i++) {
 		target_ctx_t *t = disconnected_targets[i];
 		for (view_ctx_t *v = t->first_view; v; v = v->next_view) {
-			fprintf(f, "%s %d %d %d %d %d %d\n",
+			fprintf(f, "%s %d %d %d %d %d %d %d\n",
 				t->name,
 				v->cap_x, v->cap_y,
 				v->cap_width, v->cap_height,
-				v->view_x, v->view_y);
+				v->view_x, v->view_y,
+				v->notify);
 		}
 	}
 
@@ -858,12 +871,14 @@ restore_state(void)
 		if (len == 0 || line[0] == '#')
 			continue;
 
-		/* parse from the end: last 6 fields are ints,
-		 * everything before is the name */
-		int vals[6];
+		/* parse from the end: last 7 fields are ints,
+		 * everything before is the name.
+		 * (backward compat: 6 fields also accepted) */
+		int vals[7] = {0};
+		int nvals = 7;
 		char *p = line + len;
 		int got = 0;
-		for (got = 5; got >= 0; got--) {
+		for (got = nvals - 1; got >= 0; got--) {
 			/* skip trailing spaces */
 			while (p > line && *(p - 1) == ' ')
 				p--;
@@ -876,9 +891,25 @@ restore_state(void)
 				break;
 		}
 		if (got > 0) {
-			deb("restore_state: failed to parse line: %s\n",
-				line);
-			continue;
+			/* try 6-field format (no notify) */
+			nvals = 6;
+			p = line + len;
+			for (got = nvals - 1; got >= 0; got--) {
+				while (p > line && *(p - 1) == ' ')
+					p--;
+				while (p > line && *(p - 1) != ' ')
+					p--;
+				vals[got] = atoi(p);
+				p--;
+				if (p < line)
+					break;
+			}
+			vals[6] = 0;
+			if (got > 0) {
+				deb("restore_state: failed to parse line: %s\n",
+					line);
+				continue;
+			}
 		}
 
 		/* name is everything before the space before first int */
@@ -894,9 +925,10 @@ restore_state(void)
 		memcpy(name, line, name_len);
 		name[name_len] = '\0';
 
-		deb("restore: name='%s' cap=%d,%d %dx%d view=%d,%d\n",
+		deb("restore: name='%s' cap=%d,%d %dx%d view=%d,%d "
+			"notify=%d\n",
 			name, vals[0], vals[1], vals[2], vals[3],
-			vals[4], vals[5]);
+			vals[4], vals[5], vals[6]);
 
 		xcb_window_t wm_win, client_win;
 		if (find_window_by_name(name, &wm_win, &client_win)) {
@@ -943,11 +975,21 @@ restore_state(void)
 				xcb_configure_window(c, v->window,
 					XCB_CONFIG_WINDOW_X |
 					XCB_CONFIG_WINDOW_Y, pos);
+				if (vals[6]) {
+					v->notify = 1;
+					set_border_color(v, 0xff00ff00);
+				}
 			}
 		} else {
 			create_disconnected_view(name,
 				vals[0], vals[1], vals[2], vals[3],
 				vals[4], vals[5]);
+			if (vals[6]) {
+				/* last added window is the view */
+				view_ctx_t *v = windows[nwindows - 1].ctx;
+				v->notify = 1;
+				set_border_color(v, 0xff00ff00);
+			}
 		}
 	}
 
@@ -1256,6 +1298,50 @@ resize_view(view_ctx_t *v)
 }
 
 void
+set_border_color(view_ctx_t *v, uint32_t color)
+{
+	xcb_change_window_attributes(c, v->window, XCB_CW_BACK_PIXEL,
+		&color);
+	int w = v->cap_width + 2 * border_width;
+	int h = v->cap_height + 2 * border_width;
+	xcb_rectangle_t rects[4] = {
+		{ 0, 0, w, border_width },                         /* top */
+		{ 0, h - border_width, w, border_width },          /* bottom */
+		{ 0, border_width, border_width, h - 2 * border_width }, /* left */
+		{ w - border_width, border_width, border_width, h - 2 * border_width }, /* right */
+	};
+	xcb_clear_area(c, 0, v->window, rects[0].x, rects[0].y,
+		rects[0].width, rects[0].height);
+	xcb_clear_area(c, 0, v->window, rects[1].x, rects[1].y,
+		rects[1].width, rects[1].height);
+	xcb_clear_area(c, 0, v->window, rects[2].x, rects[2].y,
+		rects[2].width, rects[2].height);
+	xcb_clear_area(c, 0, v->window, rects[3].x, rects[3].y,
+		rects[3].width, rects[3].height);
+}
+
+void
+update_notify_borders(void)
+{
+	struct timeval now;
+	gettimeofday(&now, NULL);
+
+	for (int i = 0; i < nwindows; i++) {
+		if (windows[i].type != WIN_TYPE_VIEW)
+			continue;
+		view_ctx_t *v = windows[i].ctx;
+		if (!v->notify_flash)
+			continue;
+		long elapsed_ms =
+			(now.tv_sec - v->notify_flash_start.tv_sec) * 1000 +
+			(now.tv_usec - v->notify_flash_start.tv_usec) / 1000;
+		long phase = elapsed_ms % 1000;
+		uint32_t color = (phase < 200) ? 0xffff0000 : 0xff00ff00;
+		set_border_color(v, color);
+	}
+}
+
+void
 handle_view_event(xcb_generic_event_t *e, void *ctx)
 {
 	view_ctx_t *v = ctx;
@@ -1444,8 +1530,21 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 		xcb_key_press_event_t *kp = (void *)e;
 		deb("key press event, detail %d state 0x%x\n",
 			kp->detail, kp->state);
+		if (kp->detail == 57) { /* 'n' — toggle notify mode */
+			v->notify = !v->notify;
+			if (v->notify) {
+				set_border_color(v, 0xff00ff00);
+			} else {
+				if (v->notify_flash) {
+					v->notify_flash = 0;
+					notify_flashing_count--;
+				}
+				set_border_color(v, 0xff000000);
+			}
+			xcb_flush(c);
+			save_state();
 		// Escape or backspace or del
-		if (kp->detail == 9 || kp->detail == 22 ||
+		} else if (kp->detail == 9 || kp->detail == 22 ||
 		    kp->detail == 119) {
 			deb("Escape pressed, closing view\n");
 			destroy_view(v);
@@ -1497,6 +1596,13 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 				redraw_view(v);
 				save_state();
 			}
+		}
+	} else if (rt == XCB_ENTER_NOTIFY) {
+		if (v->notify_flash) {
+			v->notify_flash = 0;
+			notify_flashing_count--;
+			set_border_color(v, 0xff00ff00);
+			xcb_flush(c);
 		}
 	} else {
 		deb("view: discarding event type %d\n", rt);
@@ -1697,6 +1803,11 @@ handle_target_event(xcb_generic_event_t *e, void *ctx)
 				continue;
 			}
 			redraw_view(v);
+			if (v->notify && !v->notify_flash) {
+				v->notify_flash = 1;
+				gettimeofday(&v->notify_flash_start, NULL);
+				notify_flashing_count++;
+			}
 		}
 	} else if (rt == XCB_UNMAP_NOTIFY) {
 		xcb_unmap_notify_event_t *um = (void *)e;
@@ -1800,7 +1911,6 @@ handle_event(xcb_generic_event_t *e)
 		hover_x = en->root_x;
 		hover_y = en->root_y;
 		gettimeofday(&hover_start, NULL);
-		return;
 	}
 	if (rt == XCB_LEAVE_NOTIFY) {
 		hover_window = XCB_WINDOW_NONE;
@@ -1879,6 +1989,9 @@ main(int argc, char **argv)
 	while (1) {
 		int timeout_ms = (hover_window != XCB_WINDOW_NONE &&
 				  tooltip_window == XCB_WINDOW_NONE) ? 500 : -1;
+		if (notify_flashing_count > 0 &&
+		    (timeout_ms < 0 || timeout_ms > 200))
+			timeout_ms = 200;
 		poll(&pfd, 1, timeout_ms);
 
 		while ((e = xcb_poll_for_event(c))) {
@@ -1899,6 +2012,10 @@ main(int argc, char **argv)
 			if (elapsed_ms >= 3000)
 				show_tooltip(hover_x, hover_y);
 		}
+
+		if (notify_flashing_count > 0)
+			update_notify_borders();
+
 		xcb_flush(c);
 	}
 
