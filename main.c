@@ -1291,6 +1291,7 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 		}
 		if (bp->detail == XCB_BUTTON_INDEX_3) {
 			v->button3_pressed = 1;
+			hover_window = XCB_WINDOW_NONE;
 			v->move_offset_x = bp->event_x;
 			v->move_offset_y = bp->event_y;
 			deb("button 3 pressed\n");
@@ -1314,8 +1315,17 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 			mv->root_x, mv->root_y, mv->event_x, mv->event_y,
 			mv->state);
 
+		hover_window = XCB_WINDOW_NONE;
+
 		int new_x = mv->root_x - v->move_offset_x;
 		int new_y = mv->root_y - v->move_offset_y;
+		int shift = mv->state & XCB_MOD_MASK_SHIFT;
+
+		if (shift) {
+			v->docked_x = 0;
+			v->docked_y = 0;
+			goto apply_move;
+		}
 
 		/* Break free from docking after 12px mouse movement per axis */
 		if (v->docked_x && abs(mv->root_x - v->dock_mouse_x) >= 12)
@@ -1377,6 +1387,26 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 				if (abs(new_y - (oy + oh)) <= 1)
 					{ new_y = oy + oh; snapped_y = 1; }
 			}
+
+			/* When side-by-side, align tops/bottoms */
+			int h_adj = (abs(new_x + w - ox) <= 1) ||
+				    (abs(new_x - (ox + ow)) <= 1);
+			if (h_adj) {
+				if (abs(new_y - oy) <= 1)
+					{ new_y = oy; snapped_y = 1; }
+				if (abs(new_y + h - (oy + oh)) <= 1)
+					{ new_y = oy + oh - h; snapped_y = 1; }
+			}
+
+			/* When stacked, align lefts/rights */
+			int v_adj = (abs(new_y + h - oy) <= 1) ||
+				    (abs(new_y - (oy + oh)) <= 1);
+			if (v_adj) {
+				if (abs(new_x - ox) <= 1)
+					{ new_x = ox; snapped_x = 1; }
+				if (abs(new_x + w - (ox + ow)) <= 1)
+					{ new_x = ox + ow - w; snapped_x = 1; }
+			}
 		}
 
 		if (snapped_x && !v->docked_x) {
@@ -1390,6 +1420,7 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 			v->dock_view_y = new_y;
 		}
 
+	apply_move:;
 		int values[2];
 		values[0] = new_x;
 		values[1] = new_y;
