@@ -399,6 +399,7 @@ create_view_window(uint8_t depth, xcb_visualid_t visual,
 	values[2] = 0;
 	values[3] = XCB_EVENT_MASK_EXPOSURE |
 		XCB_EVENT_MASK_BUTTON_PRESS |
+		XCB_EVENT_MASK_BUTTON_RELEASE |
 		XCB_EVENT_MASK_KEY_PRESS |
 		XCB_EVENT_MASK_BUTTON_3_MOTION |
 		XCB_EVENT_MASK_STRUCTURE_NOTIFY;
@@ -1218,10 +1219,15 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 			values);
 	} else if (rt == XCB_CONFIGURE_NOTIFY) {
 		xcb_configure_notify_event_t *cn = (void *)e;
-		deb("configure notify view 0x%x at %d,%d %dx%d\n",
-			cn->window, cn->x, cn->y, cn->width, cn->height);
-		v->view_x = cn->x;
-		v->view_y = cn->y;
+		deb("configure notify view 0x%x at %d,%d %dx%d syn=%d\n",
+			cn->window, cn->x, cn->y, cn->width, cn->height,
+			!!(e->response_type & 0x80));
+		/* only trust synthetic ConfigureNotify (root-relative coords);
+		 * real ones have frame-relative coords on reparenting WMs */
+		if (e->response_type & 0x80) {
+			v->view_x = cn->x;
+			v->view_y = cn->y;
+		}
 	} else if (rt == XCB_KEY_PRESS) {
 		xcb_key_press_event_t *kp = (void *)e;
 		deb("key press event, detail %d state 0x%x\n",
