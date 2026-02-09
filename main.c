@@ -89,6 +89,12 @@ typedef struct view_ctx {
 	int move_offset_y;
 	int view_x;
 	int view_y;
+	int docked_x;
+	int docked_y;
+	int dock_mouse_x;
+	int dock_mouse_y;
+	int dock_view_x;
+	int dock_view_y;
 	struct view_ctx *next_view;
 } view_ctx_t;
 
@@ -1296,21 +1302,100 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 		    v->button3_pressed) {
 			deb("button 3 released\n");
 			v->button3_pressed = 0;
+			v->docked_x = 0;
+			v->docked_y = 0;
 			save_state();
 		}
 
 	} else if (rt == XCB_MOTION_NOTIFY) {
-		int values[2];
 		xcb_motion_notify_event_t *mv = (void *)e;
 
 		deb("motion notify event at root %d,%d event %d,%d state %d\n",
 			mv->root_x, mv->root_y, mv->event_x, mv->event_y,
 			mv->state);
-		values[0] = mv->root_x - v->move_offset_x;
-		values[1] = mv->root_y - v->move_offset_y;
-		v->view_x = values[0];
-		v->view_y = values[1];
-		xcb_configure_window (c, v->window,
+
+		int new_x = mv->root_x - v->move_offset_x;
+		int new_y = mv->root_y - v->move_offset_y;
+
+		/* Break free from docking after 12px mouse movement per axis */
+		if (v->docked_x && abs(mv->root_x - v->dock_mouse_x) >= 12)
+			v->docked_x = 0;
+		if (v->docked_y && abs(mv->root_y - v->dock_mouse_y) >= 12)
+			v->docked_y = 0;
+
+		/* Hold docked axis at its docked position */
+		if (v->docked_x)
+			new_x = v->dock_view_x;
+		if (v->docked_y)
+			new_y = v->dock_view_y;
+
+		int snapped_x = 0, snapped_y = 0;
+		int sw = screen->width_in_pixels;
+		int sh = screen->height_in_pixels;
+		int bw2 = 2 * border_width;
+		int w = v->cap_width + bw2;
+		int h = v->cap_height + bw2;
+
+		/* Snap to screen edges */
+		if (abs(new_x) <= 1) { new_x = 0; snapped_x = 1; }
+		if (abs(new_y) <= 1) { new_y = 0; snapped_y = 1; }
+		if (abs(new_x + w - sw) <= 1) { new_x = sw - w; snapped_x = 1; }
+		if (abs(new_y + h - sh) <= 1) { new_y = sh - h; snapped_y = 1; }
+
+		/* Snap to other view windows */
+		for (int i = 0; i < nwindows; i++) {
+			if (windows[i].type != WIN_TYPE_VIEW)
+				continue;
+			view_ctx_t *o = windows[i].ctx;
+			if (o == v)
+				continue;
+			int ow = o->cap_width + bw2;
+			int oh = o->cap_height + bw2;
+			int ox = o->view_x;
+			int oy = o->view_y;
+
+			/* Check vertical overlap for left/right snapping */
+			int v_overlap = (new_y < oy + oh) &&
+					(new_y + h > oy);
+			if (v_overlap) {
+				/* My right edge to other's left edge */
+				if (abs(new_x + w - ox) <= 1)
+					{ new_x = ox - w; snapped_x = 1; }
+				/* My left edge to other's right edge */
+				if (abs(new_x - (ox + ow)) <= 1)
+					{ new_x = ox + ow; snapped_x = 1; }
+			}
+
+			/* Check horizontal overlap for top/bottom snapping */
+			int h_overlap = (new_x < ox + ow) &&
+					(new_x + w > ox);
+			if (h_overlap) {
+				/* My bottom edge to other's top edge */
+				if (abs(new_y + h - oy) <= 1)
+					{ new_y = oy - h; snapped_y = 1; }
+				/* My top edge to other's bottom edge */
+				if (abs(new_y - (oy + oh)) <= 1)
+					{ new_y = oy + oh; snapped_y = 1; }
+			}
+		}
+
+		if (snapped_x && !v->docked_x) {
+			v->docked_x = 1;
+			v->dock_mouse_x = mv->root_x;
+			v->dock_view_x = new_x;
+		}
+		if (snapped_y && !v->docked_y) {
+			v->docked_y = 1;
+			v->dock_mouse_y = mv->root_y;
+			v->dock_view_y = new_y;
+		}
+
+		int values[2];
+		values[0] = new_x;
+		values[1] = new_y;
+		v->view_x = new_x;
+		v->view_y = new_y;
+		xcb_configure_window(c, v->window,
 			XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y,
 			values);
 	} else if (rt == XCB_CONFIGURE_NOTIFY) {
