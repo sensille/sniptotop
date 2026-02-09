@@ -70,6 +70,8 @@ typedef struct view_ctx {
 	int button3_pressed;
 	int move_offset_x;
 	int move_offset_y;
+	int view_x;
+	int view_y;
 	struct view_ctx *next_view;
 } view_ctx_t;
 
@@ -376,7 +378,8 @@ create_view_window(uint8_t depth, xcb_visualid_t visual,
 	values[3] = XCB_EVENT_MASK_EXPOSURE |
 		XCB_EVENT_MASK_BUTTON_PRESS |
 		XCB_EVENT_MASK_KEY_PRESS |
-		XCB_EVENT_MASK_BUTTON_3_MOTION;
+		XCB_EVENT_MASK_BUTTON_3_MOTION |
+		XCB_EVENT_MASK_STRUCTURE_NOTIFY;
 	values[4] = colormap;
 	xcb_create_window(c, depth, win,
 		screen->root, x, y, w, h,
@@ -475,6 +478,8 @@ create_view(xcb_window_t window, xcb_window_t wm_window, char *name,
 	v->button3_pressed = 0;
 	v->move_offset_x = 0;
 	v->move_offset_y = 0;
+	v->view_x = 500;
+	v->view_y = 500;
 	add_window(new_window, WIN_TYPE_VIEW, v);
 
 	t_ix = find_window(window);
@@ -609,7 +614,6 @@ save_state(void)
 {
 	char tmp_path[520];
 	FILE *f;
-	xcb_generic_error_t *err;
 
 	if (state_path[0] == '\0')
 		return;
@@ -629,36 +633,22 @@ save_state(void)
 		view_ctx_t *v = windows[i].ctx;
 		if (v->t->disconnected)
 			continue;
-		xcb_get_geometry_cookie_t gc =
-			xcb_get_geometry(c, v->window);
-		xcb_get_geometry_reply_t *geom =
-			xcb_get_geometry_reply(c, gc, &err);
-		if (!geom)
-			continue;
 		fprintf(f, "%s %d %d %d %d %d %d\n",
 			v->t->name,
 			v->cap_x, v->cap_y,
 			v->cap_width, v->cap_height,
-			geom->x, geom->y);
-		free(geom);
+			v->view_x, v->view_y);
 	}
 
 	/* save disconnected views */
 	for (int i = 0; i < n_disconnected; i++) {
 		target_ctx_t *t = disconnected_targets[i];
 		for (view_ctx_t *v = t->first_view; v; v = v->next_view) {
-			xcb_get_geometry_cookie_t gc =
-				xcb_get_geometry(c, v->window);
-			xcb_get_geometry_reply_t *geom =
-				xcb_get_geometry_reply(c, gc, &err);
-			if (!geom)
-				continue;
 			fprintf(f, "%s %d %d %d %d %d %d\n",
 				t->name,
 				v->cap_x, v->cap_y,
 				v->cap_width, v->cap_height,
-				geom->x, geom->y);
-			free(geom);
+				v->view_x, v->view_y);
 		}
 	}
 
@@ -755,6 +745,8 @@ create_disconnected_view(const char *name, int cap_x, int cap_y,
 	v->cap_y = cap_y;
 	v->cap_width = cap_w;
 	v->cap_height = cap_h;
+	v->view_x = view_x;
+	v->view_y = view_y;
 	add_window(new_window, WIN_TYPE_VIEW, v);
 
 	target_ctx_t *t = calloc(sizeof(target_ctx_t), 1);
@@ -831,6 +823,10 @@ restore_state(void)
 
 		xcb_window_t wm_win, client_win;
 		if (find_window_by_name(name, &wm_win, &client_win)) {
+			if (wm_win == top_window || client_win == top_window) {
+				deb("restore: skipping own window\n");
+				continue;
+			}
 			char *n = strdup(name);
 			/* create_view expects absolute coords,
 			 * but we saved cap-relative coords.
@@ -865,6 +861,8 @@ restore_state(void)
 			if (t_ix >= 0) {
 				target_ctx_t *t = windows[t_ix].ctx;
 				view_ctx_t *v = t->first_view;
+				v->view_x = pos[0];
+				v->view_y = pos[1];
 				xcb_configure_window(c, v->window,
 					XCB_CONFIG_WINDOW_X |
 					XCB_CONFIG_WINDOW_Y, pos);
@@ -1152,9 +1150,17 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 			mv->state);
 		values[0] = mv->root_x - v->move_offset_x;
 		values[1] = mv->root_y - v->move_offset_y;
+		v->view_x = values[0];
+		v->view_y = values[1];
 		xcb_configure_window (c, v->window,
 			XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y,
 			values);
+	} else if (rt == XCB_CONFIGURE_NOTIFY) {
+		xcb_configure_notify_event_t *cn = (void *)e;
+		deb("configure notify view 0x%x at %d,%d %dx%d\n",
+			cn->window, cn->x, cn->y, cn->width, cn->height);
+		v->view_x = cn->x;
+		v->view_y = cn->y;
 	} else if (rt == XCB_KEY_PRESS) {
 		xcb_key_press_event_t *kp = (void *)e;
 		deb("key press event, detail %d state 0x%x\n",
@@ -1480,9 +1486,8 @@ handle_event(xcb_generic_event_t *e)
 		}
 	}
 
-	/* filter other root SubstructureNotify events we don't handle */
-	if (rt == XCB_CREATE_NOTIFY || rt == XCB_REPARENT_NOTIFY ||
-	    rt == XCB_CONFIGURE_NOTIFY) {
+	/* filter root SubstructureNotify events we don't handle */
+	if (rt == XCB_CREATE_NOTIFY || rt == XCB_REPARENT_NOTIFY) {
 		deb("ignoring root event type %d\n", rt);
 		return;
 	}
@@ -1500,6 +1505,8 @@ handle_event(xcb_generic_event_t *e)
 		win = ((xcb_button_release_event_t *)e)->event;
 	} else if (rt == XCB_MOTION_NOTIFY) {
 		win = ((xcb_motion_notify_event_t *)e)->event;
+	} else if (rt == XCB_CONFIGURE_NOTIFY) {
+		win = ((xcb_configure_notify_event_t *)e)->window;
 	} else if (rt == XCB_UNMAP_NOTIFY) {
 		xcb_unmap_notify_event_t *um = (void *)e;
 		deb("unmap notify for window 0x%x event 0x%x\n",
@@ -1576,6 +1583,7 @@ main(int argc, char **argv)
 	initialize_xdamage();
 	initialize_top_window();
 	restore_state();
+	atexit(save_state);
 
 	/* subscribe to root events to detect new windows for reconnection */
 	uint32_t root_mask = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
