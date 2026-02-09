@@ -1074,6 +1074,26 @@ handle_top_event(xcb_generic_event_t *e, void *ctx)
 }
 
 void
+resize_view(view_ctx_t *v)
+{
+	int width = v->cap_width + 2 * border_width;
+	int height = v->cap_height + 2 * border_width;
+	uint32_t values[2];
+
+	xcb_size_hints_t hints;
+	xcb_icccm_size_hints_set_min_size(&hints, width, height);
+	xcb_icccm_size_hints_set_max_size(&hints, width, height);
+	xcb_icccm_set_wm_size_hints(c, v->window,
+		XCB_ATOM_WM_NORMAL_HINTS, &hints);
+
+	values[0] = width;
+	values[1] = height;
+	xcb_configure_window(c, v->window,
+		XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+		values);
+}
+
+void
 handle_view_event(xcb_generic_event_t *e, void *ctx)
 {
 	view_ctx_t *v = ctx;
@@ -1137,13 +1157,61 @@ handle_view_event(xcb_generic_event_t *e, void *ctx)
 			values);
 	} else if (rt == XCB_KEY_PRESS) {
 		xcb_key_press_event_t *kp = (void *)e;
-		deb("key press event, detail %d\n", kp->detail);
+		deb("key press event, detail %d state 0x%x\n",
+			kp->detail, kp->state);
 		// Escape or backspace or del
 		if (kp->detail == 9 || kp->detail == 22 ||
 		    kp->detail == 119) {
 			deb("Escape pressed, closing view\n");
 			destroy_view(v);
 			save_state();
+		} else if (!v->t->disconnected) {
+			int shift = kp->state & 0x01;
+			int dir = -1; /* 0=left 1=right 2=up 3=down */
+			int dx = 0, dy = 0, dw = 0, dh = 0;
+
+			switch (kp->detail) {
+			case 113: case 43: dir = 0; break; /* Left, h */
+			case 114: case 46: dir = 1; break; /* Right, l */
+			case 111: case 45: dir = 2; break; /* Up, k */
+			case 116: case 44: dir = 3; break; /* Down, j */
+			}
+			if (dir >= 0) {
+				if (shift) {
+					/* move upper-left corner */
+					switch (dir) {
+					case 0: dx = -1; dw = 1; break;
+					case 1: dx = 1; dw = -1; break;
+					case 2: dy = -1; dh = 1; break;
+					case 3: dy = 1; dh = -1; break;
+					}
+				} else {
+					/* move lower-right corner */
+					switch (dir) {
+					case 0: dw = -1; break;
+					case 1: dw = 1; break;
+					case 2: dh = -1; break;
+					case 3: dh = 1; break;
+					}
+				}
+
+				int new_w = v->cap_width + dw;
+				int new_h = v->cap_height + dh;
+				if (new_w < 1) { new_w = 1; dx = 0; }
+				if (new_h < 1) { new_h = 1; dy = 0; }
+
+				int size_changed = (new_w != v->cap_width ||
+						    new_h != v->cap_height);
+				v->cap_x += dx;
+				v->cap_y += dy;
+				v->cap_width = new_w;
+				v->cap_height = new_h;
+
+				if (size_changed)
+					resize_view(v);
+				redraw_view(v);
+				save_state();
+			}
 		}
 	} else {
 		deb("view: discarding event type %d\n", rt);
@@ -1500,7 +1568,8 @@ main(int argc, char **argv)
 	       "Then select a window by clicking on it.\n"
 	       "Then drag a rectangle with the left mouse button.\n"
 	       "To move a snip, hold down the right mouse button and drag.\n"
-	       "To close a snip, focus it and press escape.\n");
+	       "To close a snip, focus it and press escape.\n"
+	       "Arrow keys/hjkl resize (lower-right), shift: upper-left.\n");
 
 	initialize_state_path();
 	initialize_xcb();
