@@ -480,9 +480,11 @@ create_view(xcb_window_t window, xcb_window_t wm_window, char *name,
 	int n_border_width = 2;
 	int width = cap_width + 2 * n_border_width;
 	int height = cap_height + 2 * n_border_width;
+	int view_x = (x1 + x2) / 2 - width / 2;
+	int view_y = (y1 + y2) / 2 - height / 2;
 	xcb_window_t new_window = create_view_window(win_geom->depth,
 		win_attrs->visual, win_attrs->colormap,
-		500, 500, width, height, black);
+		view_x, view_y, width, height, black);
 
 	xcb_gcontext_t copy_gc = xcb_generate_id(c);
 	values[0] = grey;
@@ -502,8 +504,8 @@ create_view(xcb_window_t window, xcb_window_t wm_window, char *name,
 	v->button3_pressed = 0;
 	v->move_offset_x = 0;
 	v->move_offset_y = 0;
-	v->view_x = 500;
-	v->view_y = 500;
+	v->view_x = view_x;
+	v->view_y = view_y;
 	add_window(new_window, WIN_TYPE_VIEW, v);
 
 	t_ix = find_window(window);
