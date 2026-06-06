@@ -523,8 +523,10 @@ create_view(xcb_window_t window, xcb_window_t wm_window, char *name,
 	values[0] = grey;
 	values[1] = black;
 	values[2] = XCB_SUBWINDOW_MODE_INCLUDE_INFERIORS;
+	values[3] = 0; /* graphics_exposures: disable to avoid feedback loop */
 	xcb_create_gc(c, copy_gc, window,
-		XCB_GC_FOREGROUND | XCB_GC_BACKGROUND | XCB_GC_SUBWINDOW_MODE,
+		XCB_GC_FOREGROUND | XCB_GC_BACKGROUND | XCB_GC_SUBWINDOW_MODE |
+		XCB_GC_GRAPHICS_EXPOSURES,
 		values);
 
 	view_ctx_t *v = calloc(sizeof(view_ctx_t), 1);
@@ -825,8 +827,10 @@ create_disconnected_view(const char *name, int cap_x, int cap_y,
 	xcb_gcontext_t gc = xcb_generate_id(c);
 	values[0] = grey;
 	values[1] = black;
+	values[2] = 0; /* graphics_exposures: disable to avoid feedback loop */
 	xcb_create_gc(c, gc, new_window,
-		XCB_GC_FOREGROUND | XCB_GC_BACKGROUND, values);
+		XCB_GC_FOREGROUND | XCB_GC_BACKGROUND | XCB_GC_GRAPHICS_EXPOSURES,
+		values);
 
 	view_ctx_t *v = calloc(sizeof(view_ctx_t), 1);
 	v->window = new_window;
@@ -1722,9 +1726,11 @@ reconnect_target(target_ctx_t *t, xcb_window_t new_target,
 		values[0] = grey;
 		values[1] = black;
 		values[2] = XCB_SUBWINDOW_MODE_INCLUDE_INFERIORS;
+		values[3] = 0; /* graphics_exposures: disable to avoid feedback loop */
 		xcb_create_gc(c, v->gc, new_target,
 			XCB_GC_FOREGROUND | XCB_GC_BACKGROUND |
-			XCB_GC_SUBWINDOW_MODE, values);
+			XCB_GC_SUBWINDOW_MODE | XCB_GC_GRAPHICS_EXPOSURES,
+			values);
 		redraw_view(v);
 	}
 
